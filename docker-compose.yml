@@ -1,0 +1,63 @@
+# version: '3.8'
+
+services:
+  fastapi:
+    image: mayac-svc-fastapi:latest                                                                                                                                        
+    container_name: mayac-svc-api
+    volumes:
+      - ./FROne_SDK_3.0:/app/FROne_SDK_3.0  # 로컬 SDK 디렉토리를 컨테이너에 마운트
+      - ./app:/app               # 로컬 Python 앱 디렉토리를 컨테이너에 마운트
+      - ./logs:/logs
+      - /etc/localtime:/etc/localtime:ro
+    privileged: true
+    ports:
+      - "8080:8080"  # FastAPI의 포트를 호스트와 연결
+    environment:
+      - TZ=Asia/Seoul
+      - PYTHONUNBUFFERED=${PYTHONUNBUFFERED}
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - MARIADB_DATABASE_FILE=/run/secrets/db_name
+      - MARIADB_USER_FILE=/run/secrets/db_user_id
+      - MARIADB_PASSWORD_FILE=/run/secrets/db_user_password
+      - LD_LIBRARY_PATH=/app/FROne_SDK_3.0/3rdparty/sqisoft/lib:/usr/local/lib:/usr/lib64
+    secrets:
+      - db_name
+      - db_user_id
+      - db_user_password
+
+  db:
+    image: mariadb:10.6
+    container_name: mayac-svc-db
+    restart: always
+    # 중요: 한글 저장을 위해 utf8mb4 설정 강제
+    command:
+      - --character-set-server=utf8mb4 
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+09:00
+    environment:
+      - MARIADB_ROOT_PASSWORD_FILE=/run/secrets/db_root_password
+      - MARIADB_DATABASE_FILE=/run/secrets/db_name
+      - MARIADB_USER_FILE=/run/secrets/db_user_id
+      - MARIADB_PASSWORD_FILE=/run/secrets/db_user_password
+    secrets:
+      - db_root_password
+      - db_name
+      - db_user_id
+      - db_user_password
+    ports:
+      - "3306:3306"
+    volumes:
+      # 컨테이너를 삭제해도 데이터가 사라지지 않도록 호스트 폴더와 연결
+      - ./mariadb_data:/var/lib/mysql
+      - /etc/localtime:/etc/localtime:ro
+
+secrets:
+  db_name:
+    file: ./secrets/db_name.txt
+  db_root_password:
+    file: ./secrets/db_root_password.txt
+  db_user_id:
+    file: ./secrets/db_user_id.txt
+  db_user_password:
+    file: ./secrets/db_user_password.txt

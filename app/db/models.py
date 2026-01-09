@@ -5,7 +5,7 @@ from db.database import Base
 class TbFeature(Base):
     __tablename__ = "TB_FEATURE"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String(100), unique=True, nullable=False, index=True)
+    user_id = Column(String(200), unique=True, nullable=False, index=True)
     feature_data = Column(LargeBinary, nullable=False)
     deleted_yn = Column(String(1), default="N", nullable=False)
     created_at = Column(DateTime, default=func.now(), nullable=False)

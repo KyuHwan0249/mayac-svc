@@ -9,10 +9,10 @@ class ReloadResponse(BaseResponse):
     loaded_count: Optional[int] = None
 
 class RegisterResponse(BaseResponse):
-    face_id: Optional[int] = None
+    user_id: str
 
 class SearchResultItem(BaseModel):
-    id: int
+    user_id: str
     score: float
 
 class SearchResponse(BaseResponse):
@@ -25,7 +25,7 @@ class CompareResponse(BaseResponse):
 
 class FaceGroupInfo(BaseModel):
     count: int
-    ids: List[int]
+    user_ids: List[str]
 
 class SummaryResponse(BaseResponse):
     active: Optional[FaceGroupInfo] = None

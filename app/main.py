@@ -90,7 +90,7 @@ async def api_logging_middleware(request: Request, call_next):
         "process_time": round(process_time, 4)
     }
     response.background = BackgroundTask(write_api_log, log_data)
-    logger.info(f"📡 [{request.method}] {request.url.path} - {response.status_code} ({round(process_time, 3)}s) IP={log_data.get("getclient_ip")}")
+    logger.info(f"📡 [{request.method}] {request.url.path} - {response.status_code} ({round(process_time, 3)}s) IP={log_data.get("client_ip")}")
     return response
 
 # =============================================================================
@@ -109,7 +109,7 @@ def sync_features_from_db(sdk_instance: FROneSDK):
                 sdk_instance.append_feature(item.feature_data, item.id)
                 count += 1
             except Exception as e:
-                logger.warning(f"⚠️ ID {item.id} SDK 등록 실패: {e}")
+                logger.warning(f"⚠️ PK {item.id} (User: {item.user_id}) SDK 등록 실패: {e}")
     except Exception as e:
         logger.error(f"❌ DB 조회 중 오류 발생: {e}")
         # raise e  <-- Startup 중단을 막으려면 주석 처리 가능
@@ -176,7 +176,7 @@ async def reload_sdk():
     if not sdk: raise HTTPException(500, "SDK Not Initialized")
     logger.info("🔄 SDK Reload 요청됨")
     try:
-        async with sdk_lock: 
+        async with sdk_lock:
             sdk.reset()
             loaded_count = sync_features_from_db(sdk)
         return {"status": "success", "message": "SDK Reloaded", "loaded_count": loaded_count}
@@ -185,62 +185,97 @@ async def reload_sdk():
         return {"status": "error", "message": str(e)}
 
 @router.post("/register", response_model=RegisterResponse)
-async def register_face(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def register_face(
+    user_id: str = Form(..., min_length=1, description="External User ID (Unique)"),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
     if not sdk: raise HTTPException(500, "SDK Not Initialized")
+
+    if not user_id or not user_id.strip():
+        raise HTTPException(status_code=400, detail="User ID cannot be empty or whitespace.")
+    
+    safe_user_id = user_id.strip()
+
     try:
+        existing = db.query(TbFeature).filter(TbFeature.user_id == safe_user_id, TbFeature.deleted_yn == 'N').first()
+        if existing:
+            # JSONResponse 대신 HTTPException을 써도 되고, 기존처럼 Return 해도 됩니다. 
+            # API 일관성을 위해 409 Conflict 또는 400 Bad Request 사용 추천
+            return JSONResponse(status_code=400, content={"status": "fail", "message": f"User ID '{safe_user_id}' already exists."})
+        
         ptr, w, h = await process_image_to_ptr(file)
         async with sdk_lock:
             feature_bytes = sdk.extract_feature(ptr, w, h)
         
-        new_feature = TbFeature(feature_data=feature_bytes)
+        new_feature = TbFeature(user_id=safe_user_id, feature_data=feature_bytes)
         db.add(new_feature)
         db.commit()
         db.refresh(new_feature)
-        generated_id = new_feature.id
+        internal_pk = new_feature.id
         
         try:
             async with sdk_lock:
-                sdk.append_feature(feature_bytes, generated_id)
-            logger.info(f"✅ 사용자 등록 성공: ID {generated_id}")
+                sdk.append_feature(feature_bytes, internal_pk)
+            logger.info(f"✅ 사용자 등록 성공: UserID={safe_user_id} (PK={internal_pk})")
         except Exception as sdk_err:
             db.delete(new_feature)
             db.commit()
             raise sdk_err
         
-        return {"status": "success", "message": "Face registered.", "face_id": generated_id}
+        return {"status": "success", "message": "Face registered.", "user_id": safe_user_id}
     except Exception as e:
         db.rollback()
         logger.error(f"❌ Register 오류: {e}", exc_info=True)
         return {"status": "error", "message": str(e)}
 
 @router.post("/search", response_model=SearchResponse)
-async def search_face(file: UploadFile = File(...), max_results: int = Form(5)):
+async def search_face(file: UploadFile = File(...), max_results: int = Form(5), db: Session = Depends(get_db)):
     if not sdk: raise HTTPException(500, "SDK Not Initialized")
     try:
         ptr, w, h = await process_image_to_ptr(file)
         async with sdk_lock:
             probe_feat = sdk.extract_feature(ptr, w, h)
-            results = sdk.identify(probe_feat, max_matches=max_results)
-        return {"status": "success", "count": len(results), "results": results}
+            sdk_results = sdk.identify(probe_feat, max_matches=max_results)
+
+        if not sdk_results:
+            return {"status": "success", "count": 0, "results": []}
+        
+        found_pks = [item['id'] for item in sdk_results]
+        rows = db.query(TbFeature.id, TbFeature.user_id).filter(TbFeature.id.in_(found_pks)).all()
+        pk_to_userid = {row.id: row.user_id for row in rows}
+
+        final_results = []
+        for res in sdk_results:
+            pk = res['id']
+            if pk in pk_to_userid:
+                final_results.append({
+                    "user_id": pk_to_userid[pk],
+                    "score": res['score']
+                })
+
+        return {"status": "success", "count": len(final_results), "results": final_results}
     except Exception as e:
-        logger.error(f"❌ Search 오류: {e}", exc_info=True)
+        logger.error(f"❌ Search 오류: {e}")
         return {"status": "error", "message": str(e)}
 
-@router.delete("/faces/{face_id}", response_model=BaseResponse)
-async def delete_face(face_id: int, db: Session = Depends(get_db)):
+@router.delete("/faces/{user_id}", response_model=BaseResponse)
+async def delete_face(user_id: str, db: Session = Depends(get_db)):
     if not sdk: raise HTTPException(500, "SDK Not Initialized")
-    target = db.query(TbFeature).filter(TbFeature.id == face_id, TbFeature.deleted_yn == 'N').first()
-    if not target: return {"status": "fail", "message": "Face not found"}
+    target = db.query(TbFeature).filter(TbFeature.user_id == user_id, TbFeature.deleted_yn == 'N').first()
+    if not target: 
+        return {"status": "fail", "message": f"User ID '{user_id}' not found"}
+    internal_pk = target.id
     try:
         try:
             async with sdk_lock: 
-                sdk.remove_feature(face_id)
+                sdk.remove_feature(internal_pk)
         except: pass 
         target.deleted_yn = 'Y'
         target.deleted_at = func.now()
         db.commit()
-        logger.info(f"🗑️ 사용자 삭제(Soft) 완료: ID {face_id}")
-        return {"status": "success", "message": f"Face {face_id} deleted."}
+        logger.info(f"🗑️ 사용자 삭제(Soft) 완료: UserID={user_id} (PK={internal_pk})")
+        return {"status": "success", "message": f"User {user_id} deleted."}
     except Exception as e:
         db.rollback()
         logger.error(f"❌ Delete 오류: {e}")
@@ -264,32 +299,34 @@ async def compare_faces(file1: UploadFile = File(...), file2: UploadFile = File(
 @router.get("/faces/summary", response_model=SummaryResponse)
 def get_face_summary(db: Session = Depends(get_db)):
     try:
-        active_ids = [r.id for r in db.query(TbFeature.id).filter(TbFeature.deleted_yn == 'N').all()]
-        deleted_ids = [r.id for r in db.query(TbFeature.id).filter(TbFeature.deleted_yn == 'Y').all()]
+        active_users = [r.user_id for r in db.query(TbFeature.user_id).filter(TbFeature.deleted_yn == 'N').all()]
+        deleted_users = [r.user_id for r in db.query(TbFeature.user_id).filter(TbFeature.deleted_yn == 'Y').all()]
         return {
             "status": "success",
-            "active": { "count": len(active_ids), "ids": active_ids },
-            "deleted": { "count": len(deleted_ids), "ids": deleted_ids },
-            "total_records": len(active_ids) + len(deleted_ids)
+            "active": { "count": len(active_users), "user_ids": active_users },
+            "deleted": { "count": len(deleted_users), "user_ids": deleted_users },
+            "total_records": len(active_users) + len(deleted_users)
         }
     except Exception as e:
         logger.error(f"❌ Summary 오류: {e}")
         return {"status": "error", "message": str(e)}
 
-@router.delete("/faces/{face_id}/hard", response_model=BaseResponse)
-async def hard_delete_face(face_id: int, db: Session = Depends(get_db)):
+@router.delete("/faces/{user_id}/hard", response_model=BaseResponse)
+async def hard_delete_face(user_id: str, db: Session = Depends(get_db)):
     if not sdk: raise HTTPException(500, "SDK Not Initialized")
-    target = db.query(TbFeature).filter(TbFeature.id == face_id).first()
-    if not target: return {"status": "fail", "message": "Face not found"}
+    target = db.query(TbFeature).filter(TbFeature.user_id == user_id).first()
+    if not target: 
+        return {"status": "fail", "message": f"User ID '{user_id}' not found"}
+    internal_pk = target.id
     try:
         try:
-            async with sdk_lock:  
-                sdk.remove_feature(face_id)
+            async with sdk_lock: 
+                sdk.remove_feature(internal_pk)
         except: pass
         db.delete(target)
         db.commit()
-        logger.info(f"🔥 사용자 영구 삭제 완료: ID {face_id}")
-        return {"status": "success", "message": f"Face {face_id} permanently deleted."}
+        logger.info(f"🔥 사용자 영구 삭제 완료: ID {internal_pk}, user_id {user_id}")
+        return {"status": "success", "message": f"Face {user_id} permanently deleted."}
     except Exception as e:
         db.rollback()
         logger.error(f"❌ Hard Delete 오류: {e}")
@@ -309,27 +346,27 @@ def cleanup_deleted_faces(db: Session = Depends(get_db)):
         logger.error(f"❌ Cleanup 오류: {e}")
         return {"status": "error", "message": str(e)}
 
-@router.put("/faces/{face_id}", response_model=BaseResponse)
-async def update_face_feature(face_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+@router.put("/faces/{user_id}", response_model=BaseResponse)
+async def update_face_feature(user_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
     if not sdk: raise HTTPException(500, "SDK Not Initialized")
-    target = db.query(TbFeature).filter(TbFeature.id == face_id, TbFeature.deleted_yn == 'N').first()
-    if not target: return {"status": "fail", "message": "Active face not found"}
+    target = db.query(TbFeature).filter(TbFeature.user_id == user_id, TbFeature.deleted_yn == 'N').first()
+    if not target: 
+        return {"status": "fail", "message": f"User ID '{user_id}' not found"}
+    internal_pk = target.id
     try:
         ptr, w, h = await process_image_to_ptr(file)
         async with sdk_lock:
             new_feature_bytes = sdk.extract_feature(ptr, w, h)
-            try: sdk.remove_feature(face_id)
+            try: sdk.remove_feature(internal_pk)
             except: pass
-            sdk.append_feature(new_feature_bytes, face_id)
+            sdk.append_feature(new_feature_bytes, internal_pk)
         target.feature_data = new_feature_bytes
         db.commit()
-        logger.info(f"🔄 사용자 업데이트 완료: ID {face_id}")
-        return {"status": "success", "message": f"Face {face_id} feature updated."}
+        logger.info(f"🔄 사용자 업데이트 완료: UserID={user_id}")
+        return {"status": "success", "message": f"User {user_id} feature updated."}
     except Exception as e:
         db.rollback()
-        try:
-            async with sdk_lock:  
-                sdk.remove_feature(face_id)
+        try: sdk.remove_feature(internal_pk)
         except: pass
         logger.error(f"❌ Update 오류: {e}")
         return {"status": "error", "message": str(e)}

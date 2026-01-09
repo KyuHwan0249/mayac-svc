@@ -172,12 +172,13 @@ def shutdown_event():
 # [중요] 모든 @app.post -> @router.post 로 변경
 
 @router.post("/reload", response_model=ReloadResponse)
-def reload_sdk():
+async def reload_sdk():
     if not sdk: raise HTTPException(500, "SDK Not Initialized")
     logger.info("🔄 SDK Reload 요청됨")
     try:
-        sdk.reset()
-        loaded_count = sync_features_from_db(sdk)
+        async with sdk_lock: 
+            sdk.reset()
+            loaded_count = sync_features_from_db(sdk)
         return {"status": "success", "message": "SDK Reloaded", "loaded_count": loaded_count}
     except Exception as e:
         logger.error(f"❌ Reload 실패: {e}", exc_info=True)
@@ -226,12 +227,14 @@ async def search_face(file: UploadFile = File(...), max_results: int = Form(5)):
         return {"status": "error", "message": str(e)}
 
 @router.delete("/faces/{face_id}", response_model=BaseResponse)
-def delete_face(face_id: int, db: Session = Depends(get_db)):
+async def delete_face(face_id: int, db: Session = Depends(get_db)):
     if not sdk: raise HTTPException(500, "SDK Not Initialized")
     target = db.query(TbFeature).filter(TbFeature.id == face_id, TbFeature.deleted_yn == 'N').first()
     if not target: return {"status": "fail", "message": "Face not found"}
     try:
-        try: sdk.remove_feature(face_id)
+        try:
+            async with sdk_lock: 
+                sdk.remove_feature(face_id)
         except: pass 
         target.deleted_yn = 'Y'
         target.deleted_at = func.now()
@@ -274,12 +277,14 @@ def get_face_summary(db: Session = Depends(get_db)):
         return {"status": "error", "message": str(e)}
 
 @router.delete("/faces/{face_id}/hard", response_model=BaseResponse)
-def hard_delete_face(face_id: int, db: Session = Depends(get_db)):
+async def hard_delete_face(face_id: int, db: Session = Depends(get_db)):
     if not sdk: raise HTTPException(500, "SDK Not Initialized")
     target = db.query(TbFeature).filter(TbFeature.id == face_id).first()
     if not target: return {"status": "fail", "message": "Face not found"}
     try:
-        try: sdk.remove_feature(face_id)
+        try:
+            async with sdk_lock:  
+                sdk.remove_feature(face_id)
         except: pass
         db.delete(target)
         db.commit()
@@ -322,9 +327,28 @@ async def update_face_feature(face_id: int, file: UploadFile = File(...), db: Se
         return {"status": "success", "message": f"Face {face_id} feature updated."}
     except Exception as e:
         db.rollback()
-        try: sdk.remove_feature(face_id)
+        try:
+            async with sdk_lock:  
+                sdk.remove_feature(face_id)
         except: pass
         logger.error(f"❌ Update 오류: {e}")
+        return {"status": "error", "message": str(e)}
+
+@router.delete("/reset", response_model=CleanupResponse)
+async def reset_faces(db: Session = Depends(get_db)):
+    try:
+        deleted_count = db.query(TbFeature).count()
+        if deleted_count == 0: return {"status": "success", "message": "No data"}
+        db.query(TbFeature).delete(synchronize_session=False)
+        db.commit()
+        async with sdk_lock:
+            sdk.reset()
+            loaded_count = sync_features_from_db(sdk)
+        logger.info(f"🧹 Reset 완료: {deleted_count}건 삭제됨, {loaded_count}건 로드됨")
+        return {"status": "success", "message": "Reset completed", "deleted_count": deleted_count, "loaded_count": loaded_count }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ Reset 오류: {e}")
         return {"status": "error", "message": str(e)}
 
 # [마지막] 라우터를 앱에 등록

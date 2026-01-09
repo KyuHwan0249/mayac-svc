@@ -1,3 +1,5 @@
 FROne_SDK_3.0/*
 logs/*
 mariadb_data/
+**/__pycache__/
+*.pyc
